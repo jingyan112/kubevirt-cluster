@@ -19,6 +19,8 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -340,6 +342,41 @@ func patchKubeadmControlPlane(ctx context.Context, patchHelper *patch.Helper, kc
 	return patchHelper.Patch(ctx, kcp, options...)
 }
 
+func apiserTenantconfig(lables map[string]string, apiserverip string) {
+
+	if lables == nil {
+		return
+	}
+
+	if apiserverip == "" {
+		return
+	}
+
+	msmngapisever := lables["metastone/manager-gw"]
+	if msmngapisever == "" {
+		return
+	}
+	filename := fmt.Sprintf("/metastone/%s", apiserverip)
+	filefd, err := os.Stat(filename)
+	if filefd != nil && err == nil {
+		return
+	}
+	commands := []string{"route", "add", apiserverip + "/32", "via", msmngapisever}
+	exec.Command("ip", commands...).CombinedOutput()
+	os.WriteFile(filename, []byte(msmngapisever), os.ModePerm)
+	//关闭网卡硬件tx加速
+	commands = []string{"--offload", "net1", "tx", "off"}
+	_, err = exec.Command("/usr/sbin/ethtool", commands...).CombinedOutput()
+	if err != nil {
+		fmt.Printf("apiserTenantconfig ethtool err=%s", err.Error())
+	}
+	commands = []string{"-w", "net.ipv4.tcp_mtu_probing=1"}
+	_, err = exec.Command("/usr/sbin/sysctl", commands...).CombinedOutput()
+	if err != nil {
+		fmt.Printf("apiserTenantconfig sysctl err=%s", err.Error())
+	}
+}
+
 // reconcile handles KubeadmControlPlane reconciliation.
 func (r *KubeadmControlPlaneReconciler) reconcile(ctx context.Context, controlPlane *internal.ControlPlane) (res ctrl.Result, reterr error) {
 	log := ctrl.LoggerFrom(ctx)
@@ -366,6 +403,9 @@ func (r *KubeadmControlPlaneReconciler) reconcile(ctx context.Context, controlPl
 		log.Info("Cluster does not yet have a ControlPlaneEndpoint defined")
 		return ctrl.Result{}, nil
 	}
+
+	//配置到apiserver的路由到管理组的subnet网关
+	apiserTenantconfig(controlPlane.Cluster.Labels, controlPlane.Cluster.Spec.ControlPlaneEndpoint.Host)
 
 	// Generate Cluster Kubeconfig if needed
 	if result, err := r.reconcileKubeconfig(ctx, controlPlane); !result.IsZero() || err != nil {

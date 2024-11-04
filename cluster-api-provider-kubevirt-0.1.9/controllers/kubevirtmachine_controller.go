@@ -190,6 +190,7 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 
 	// Make sure bootstrap data is available and populated.
 	if ctx.Machine.Spec.Bootstrap.DataSecretName == nil {
+
 		if !util.IsControlPlaneMachine(ctx.Machine) && !conditions.IsTrue(ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
 			ctx.Logger.Info("Waiting for the control plane to be initialized...")
 			conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, clusterv1.WaitingForControlPlaneAvailableReason, clusterv1.ConditionSeverityInfo, "")
@@ -313,12 +314,14 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 	}
 
 	if externalMachine.SupportsCheckingIsBootstrapped() && !conditions.IsTrue(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition) {
-		if !externalMachine.IsBootstrapped() {
-			ctx.Logger.Info("Waiting for underlying VM to bootstrap...")
-			conditions.MarkFalse(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition, infrav1.BootstrapFailedReason, clusterv1.ConditionSeverityWarning, "VM not bootstrapped yet")
-			ctx.KubevirtMachine.Status.Ready = false
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
+		/*
+		   if !externalMachine.IsBootstrapped() {
+		       ctx.Logger.Info("Waiting for underlying VM to bootstrap...")
+		       conditions.MarkFalse(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition, infrav1.BootstrapFailedReason, clusterv1.ConditionSeverityWarning, "VM not bootstrapped yet")
+		       ctx.KubevirtMachine.Status.Ready = false
+		       return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		   }
+		*/
 		// Update the condition BootstrapExecSucceededCondition
 		conditions.MarkTrue(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition)
 		ctx.Logger.Info("Underlying VM has boostrapped.")

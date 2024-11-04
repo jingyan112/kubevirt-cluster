@@ -19,6 +19,8 @@ package controllers
 import (
 	gocontext "context"
 	"fmt"
+	"os"
+	"os/exec"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -243,6 +245,18 @@ func (r *KubevirtClusterReconciler) reconcileDelete(ctx *context.ClusterContext,
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
+	if ctx.KubevirtCluster.Labels != nil {
+		msmngapisever := ctx.KubevirtCluster.Labels["metastone/manager-gw"]
+		apiserverip := ctx.KubevirtCluster.Spec.ControlPlaneEndpoint.Host
+		if msmngapisever != "" && apiserverip != "" {
+			commands := []string{"route", "delete", apiserverip + "/32", "via", msmngapisever}
+			exec.Command("ip", commands...).CombinedOutput()
+			filename := fmt.Sprintf("/metastone/%s", apiserverip)
+			os.Remove(filename)
+		}
+	}
+
 	conditions.MarkFalse(ctx.KubevirtCluster, infrav1.LoadBalancerAvailableCondition, clusterv1.DeletingReason, clusterv1.ConditionSeverityInfo, "")
 	if err := ctx.PatchKubevirtCluster(patchHelper); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to patch KubevirtCluster")

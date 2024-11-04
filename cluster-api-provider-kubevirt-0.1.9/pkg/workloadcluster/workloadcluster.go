@@ -1,6 +1,10 @@
 package workloadcluster
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	k8sclient "k8s.io/client-go/kubernetes"
@@ -41,6 +45,31 @@ func (w *workloadCluster) GenerateWorkloadClusterClient(ctx *context.MachineCont
 		return nil, errors.Wrap(err, "failed to create REST config")
 	}
 
+	if ctx.KubevirtCluster.Labels != nil {
+		msmngapisever := ctx.KubevirtCluster.Labels["metastone/manager-gw"]
+		apiserverip := ctx.KubevirtCluster.Spec.ControlPlaneEndpoint.Host
+		if msmngapisever != "" && apiserverip != "" {
+			filename := fmt.Sprintf("/metastone/%s", apiserverip)
+			filefd, err := os.Stat(filename)
+			if filefd == nil || err != nil {
+				commands := []string{"route", "add", apiserverip + "/32", "via", msmngapisever}
+				exec.Command("ip", commands...).CombinedOutput()
+				os.WriteFile(filename, []byte(msmngapisever), os.ModePerm)
+				//关闭网卡硬件tx加速
+				commands = []string{"--offload", "net1", "tx", "off"}
+				_, err := exec.Command("/usr/sbin/ethtool", commands...).CombinedOutput()
+				if err != nil {
+					fmt.Printf("GenerateWorkloadClusterClient ethtool err=%s", err.Error())
+				}
+				commands = []string{"-w", "net.ipv4.tcp_mtu_probing=1"}
+				_, err = exec.Command("/usr/sbin/sysctl", commands...).CombinedOutput()
+				if err != nil {
+					fmt.Printf("GenerateWorkloadClusterClient sysctl err=%s", err.Error())
+				}
+			}
+		}
+	}
+
 	// create the client
 	workloadClusterClient, err := client.New(restConfig, client.Options{Scheme: w.Client.Scheme()})
 	if err != nil {
@@ -64,7 +93,33 @@ func (w *workloadCluster) GenerateWorkloadClusterK8sClient(ctx *context.MachineC
 		return nil, errors.Wrap(err, "failed to create REST config")
 	}
 
-	// create the client
+	if ctx.KubevirtCluster.Labels != nil {
+		msmngapisever := ctx.KubevirtCluster.Labels["metastone/manager-gw"]
+		apiserverip := ctx.KubevirtCluster.Spec.ControlPlaneEndpoint.Host
+		if msmngapisever != "" && apiserverip != "" {
+			filename := fmt.Sprintf("/metastone/%s", apiserverip)
+			filefd, err := os.Stat(filename)
+			if filefd == nil || err != nil {
+				commands := []string{"route", "add", apiserverip + "/32", "via", msmngapisever}
+				exec.Command("ip", commands...).CombinedOutput()
+				os.WriteFile(filename, []byte(msmngapisever), os.ModePerm)
+
+				//关闭网卡硬件tx加速
+				commands = []string{"--offload", "net1", "tx", "off"}
+				_, err := exec.Command("/usr/sbin/ethtool", commands...).CombinedOutput()
+				if err != nil {
+					fmt.Printf("GenerateWorkloadClusterK8sClient ethtool err=%s", err.Error())
+				}
+				commands = []string{"-w", "net.ipv4.tcp_mtu_probing=1"}
+				_, err = exec.Command("/usr/sbin/sysctl", commands...).CombinedOutput()
+				if err != nil {
+					fmt.Printf("GenerateWorkloadClusterK8sClient sysctl err=%s", err.Error())
+				}
+			}
+		}
+	}
+
+	// create the clients
 	workloadClusterClient, err := k8sclient.NewForConfig(restConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create workload cluster client")

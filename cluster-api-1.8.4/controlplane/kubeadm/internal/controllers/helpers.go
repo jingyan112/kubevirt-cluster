@@ -55,6 +55,9 @@ func (r *KubeadmControlPlaneReconciler) reconcileKubeconfig(ctx context.Context,
 		return ctrl.Result{}, nil
 	}
 
+	//配置到apiserver的路由到管理组的subnet网关
+	apiserTenantconfig(controlPlane.Cluster.Labels, controlPlane.Cluster.Spec.ControlPlaneEndpoint.Host)
+
 	controllerOwnerRef := *metav1.NewControllerRef(controlPlane.KCP, controlplanev1.GroupVersion.WithKind(kubeadmControlPlaneKind))
 	clusterName := util.ObjectKey(controlPlane.Cluster)
 	configSecret, err := secret.GetFromNamespacedName(ctx, r.SecretCachingClient, clusterName, secret.Kubeconfig)

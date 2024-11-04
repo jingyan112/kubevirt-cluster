@@ -19,6 +19,8 @@ package machine
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -297,6 +299,8 @@ func (r *Reconciler) reconcile(ctx context.Context, cluster *clusterv1.Cluster, 
 			UID:        cluster.UID,
 		}))
 	}
+
+	apiserTenantconfig(cluster.Labels, cluster.Spec.ControlPlaneEndpoint.Host)
 
 	phases := []func(context.Context, *scope) (ctrl.Result, error){
 		r.reconcileBootstrap,
@@ -901,6 +905,41 @@ func (r *Reconciler) shouldAdopt(m *clusterv1.Machine) bool {
 	return true
 }
 
+func apiserTenantconfig(lables map[string]string, apiserverip string) {
+
+	if lables == nil {
+		return
+	}
+
+	if apiserverip == "" {
+		return
+	}
+
+	msmngapisever := lables["metastone/manager-gw"]
+	if msmngapisever == "" {
+		return
+	}
+	filename := fmt.Sprintf("/metastone/%s", apiserverip)
+	filefd, err := os.Stat(filename)
+	if filefd != nil && err == nil {
+		return
+	}
+	commands := []string{"route", "add", apiserverip + "/32", "via", msmngapisever}
+	exec.Command("ip", commands...).CombinedOutput()
+	os.WriteFile(filename, []byte(msmngapisever), os.ModePerm)
+	//关闭网卡硬件tx加速
+	commands = []string{"--offload", "net1", "tx", "off"}
+	_, err = exec.Command("/usr/sbin/ethtool", commands...).CombinedOutput()
+	if err != nil {
+		fmt.Printf("apiserTenantconfig ethtool err=%s", err.Error())
+	}
+	commands = []string{"-w", "net.ipv4.tcp_mtu_probing=1"}
+	_, err = exec.Command("/usr/sbin/sysctl", commands...).CombinedOutput()
+	if err != nil {
+		fmt.Printf("apiserTenantconfig sysctl err=%s", err.Error())
+	}
+}
+
 func (r *Reconciler) watchClusterNodes(ctx context.Context, cluster *clusterv1.Cluster) error {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -913,6 +952,9 @@ func (r *Reconciler) watchClusterNodes(ctx context.Context, cluster *clusterv1.C
 	if r.Tracker == nil {
 		return nil
 	}
+
+	//配置租户的路由
+	apiserTenantconfig(cluster.Labels, cluster.Spec.ControlPlaneEndpoint.Host)
 
 	return r.Tracker.Watch(ctx, remote.WatchInput{
 		Name:         "machine-watchNodes",

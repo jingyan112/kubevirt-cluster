@@ -19,6 +19,8 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strconv"
 	"time"
 
@@ -250,6 +252,41 @@ func (r *KubeadmConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return res, err
 }
 
+func apiserTenantconfig(lables map[string]string, apiserverip string) {
+
+	if lables == nil {
+		return
+	}
+
+	if apiserverip == "" {
+		return
+	}
+
+	msmngapisever := lables["metastone/manager-gw"]
+	if msmngapisever == "" {
+		return
+	}
+	filename := fmt.Sprintf("/metastone/%s", apiserverip)
+	filefd, err := os.Stat(filename)
+	if filefd != nil && err == nil {
+		return
+	}
+	commands := []string{"route", "add", apiserverip + "/32", "via", msmngapisever}
+	exec.Command("ip", commands...).CombinedOutput()
+	os.WriteFile(filename, []byte(msmngapisever), os.ModePerm)
+	//关闭网卡硬件tx加速
+	commands = []string{"--offload", "net1", "tx", "off"}
+	_, err = exec.Command("/usr/sbin/ethtool", commands...).CombinedOutput()
+	if err != nil {
+		fmt.Printf("apiserTenantconfig ethtool err=%s", err.Error())
+	}
+	commands = []string{"-w", "net.ipv4.tcp_mtu_probing=1"}
+	_, err = exec.Command("/usr/sbin/sysctl", commands...).CombinedOutput()
+	if err != nil {
+		fmt.Printf("apiserTenantconfig sysctl err=%s", err.Error())
+	}
+}
+
 func (r *KubeadmConfigReconciler) reconcile(ctx context.Context, scope *Scope, cluster *clusterv1.Cluster, config *bootstrapv1.KubeadmConfig, configOwner *bsutil.ConfigOwner) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -293,6 +330,9 @@ func (r *KubeadmConfigReconciler) reconcile(ctx context.Context, scope *Scope, c
 	if !conditions.IsTrue(cluster, clusterv1.ControlPlaneInitializedCondition) {
 		return r.handleClusterNotInitialized(ctx, scope)
 	}
+
+	//配置租户apiserver的路由
+	apiserTenantconfig(cluster.Labels, cluster.Spec.ControlPlaneEndpoint.Host)
 
 	// Every other case it's a join scenario
 	// Nb. in this case ClusterConfiguration and InitConfiguration should not be defined by users, but in case of misconfigurations, CABPK simply ignore them

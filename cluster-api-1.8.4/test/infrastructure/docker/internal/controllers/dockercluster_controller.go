@@ -1,0 +1,216 @@
+/*
+Copyright 2019 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package controllers implements controller functionality.
+package controllers
+
+import (
+	"context"
+
+	"github.com/pkg/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/test/infrastructure/container"
+	infrav1 "sigs.k8s.io/cluster-api/test/infrastructure/docker/api/v1beta1"
+	"sigs.k8s.io/cluster-api/test/infrastructure/docker/internal/docker"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/predicates"
+)
+
+// DockerClusterReconciler reconciles a DockerCluster object.
+type DockerClusterReconciler struct {
+	client.Client
+	ContainerRuntime container.Runtime
+
+	// WatchFilterValue is the label value used to filter events prior to reconciliation.
+	WatchFilterValue string
+}
+
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=dockerclusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=dockerclusters/status;dockerclusters/finalizers,verbs=get;update;patch
+
+// Reconcile reads that state of the cluster for a DockerCluster object and makes changes based on the state read
+// and what is in the DockerCluster.Spec.
+func (r *DockerClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
+	log := ctrl.LoggerFrom(ctx)
+	ctx = container.RuntimeInto(ctx, r.ContainerRuntime)
+
+	// Fetch the DockerCluster instance
+	dockerCluster := &infrav1.DockerCluster{}
+	if err := r.Client.Get(ctx, req.NamespacedName, dockerCluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Fetch the Cluster.
+	cluster, err := util.GetOwnerCluster(ctx, r.Client, dockerCluster.ObjectMeta)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if cluster == nil {
+		log.Info("Waiting for Cluster Controller to set OwnerRef on DockerCluster")
+		return ctrl.Result{}, nil
+	}
+
+	log = log.WithValues("Cluster", klog.KObj(cluster))
+	ctx = ctrl.LoggerInto(ctx, log)
+
+	// Initialize the patch helper
+	patchHelper, err := patch.NewHelper(dockerCluster, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Always attempt to Patch the DockerCluster object and status after each reconciliation.
+	defer func() {
+		if err := patchDockerCluster(ctx, patchHelper, dockerCluster); err != nil {
+			log.Error(err, "Failed to patch DockerCluster")
+			if rerr == nil {
+				rerr = err
+			}
+		}
+	}()
+
+	// Create a helper for managing a docker container hosting the loadbalancer.
+	externalLoadBalancer, err := docker.NewLoadBalancer(ctx, cluster, dockerCluster)
+	if err != nil {
+		conditions.MarkFalse(dockerCluster, infrav1.LoadBalancerAvailableCondition, infrav1.LoadBalancerProvisioningFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+		return ctrl.Result{}, errors.Wrapf(err, "failed to create helper for managing the externalLoadBalancer")
+	}
+
+	// Support FailureDomains
+	// In cloud providers this would likely look up which failure domains are supported and set the status appropriately.
+	// In the case of Docker, failure domains don't mean much so we simply copy the Spec into the Status.
+	dockerCluster.Status.FailureDomains = dockerCluster.Spec.FailureDomains
+
+	// Handle deleted clusters
+	if !dockerCluster.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, r.reconcileDelete(ctx, dockerCluster, externalLoadBalancer)
+	}
+
+	// Add finalizer first if not set to avoid the race condition between init and delete.
+	// Note: Finalizers in general can only be added when the deletionTimestamp is not set.
+	if !controllerutil.ContainsFinalizer(dockerCluster, infrav1.ClusterFinalizer) {
+		controllerutil.AddFinalizer(dockerCluster, infrav1.ClusterFinalizer)
+		return ctrl.Result{}, nil
+	}
+
+	// Handle non-deleted clusters
+	return ctrl.Result{}, r.reconcileNormal(ctx, dockerCluster, externalLoadBalancer)
+}
+
+func patchDockerCluster(ctx context.Context, patchHelper *patch.Helper, dockerCluster *infrav1.DockerCluster) error {
+	// Always update the readyCondition by summarizing the state of other conditions.
+	// A step counter is added to represent progress during the provisioning process (instead we are hiding it during the deletion process).
+	conditions.SetSummary(dockerCluster,
+		conditions.WithConditions(
+			infrav1.LoadBalancerAvailableCondition,
+		),
+		conditions.WithStepCounterIf(dockerCluster.ObjectMeta.DeletionTimestamp.IsZero()),
+	)
+
+	// Patch the object, ignoring conflicts on the conditions owned by this controller.
+	return patchHelper.Patch(
+		ctx,
+		dockerCluster,
+		patch.WithOwnedConditions{Conditions: []clusterv1.ConditionType{
+			clusterv1.ReadyCondition,
+			infrav1.LoadBalancerAvailableCondition,
+		}},
+	)
+}
+
+func (r *DockerClusterReconciler) reconcileNormal(ctx context.Context, dockerCluster *infrav1.DockerCluster, externalLoadBalancer *docker.LoadBalancer) error {
+	// Create the docker container hosting the load balancer.
+	if err := externalLoadBalancer.Create(ctx); err != nil {
+		conditions.MarkFalse(dockerCluster, infrav1.LoadBalancerAvailableCondition, infrav1.LoadBalancerProvisioningFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+		return errors.Wrap(err, "failed to create load balancer")
+	}
+
+	// Set APIEndpoints with the load balancer IP so the Cluster API Cluster Controller can pull it
+	lbIP, err := externalLoadBalancer.IP(ctx)
+	if err != nil {
+		conditions.MarkFalse(dockerCluster, infrav1.LoadBalancerAvailableCondition, infrav1.LoadBalancerProvisioningFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+		return errors.Wrap(err, "failed to get ip for the load balancer")
+	}
+
+	if dockerCluster.Spec.ControlPlaneEndpoint.Host == "" {
+		// Surface the control plane endpoint
+		// Note: the control plane port is already set by the user or defaulted by the dockerCluster webhook.
+		dockerCluster.Spec.ControlPlaneEndpoint.Host = lbIP
+	}
+
+	// Mark the dockerCluster ready
+	dockerCluster.Status.Ready = true
+	conditions.MarkTrue(dockerCluster, infrav1.LoadBalancerAvailableCondition)
+
+	return nil
+}
+
+func (r *DockerClusterReconciler) reconcileDelete(ctx context.Context, dockerCluster *infrav1.DockerCluster, externalLoadBalancer *docker.LoadBalancer) error {
+	// Set the LoadBalancerAvailableCondition reporting delete is started, and issue a patch in order to make
+	// this visible to the users.
+	// NB. The operation in docker is fast, so there is the chance the user will not notice the status change;
+	// nevertheless we are issuing a patch so we can test a pattern that will be used by other providers as well
+	patchHelper, err := patch.NewHelper(dockerCluster, r.Client)
+	if err != nil {
+		return err
+	}
+	conditions.MarkFalse(dockerCluster, infrav1.LoadBalancerAvailableCondition, clusterv1.DeletingReason, clusterv1.ConditionSeverityInfo, "")
+	if err := patchDockerCluster(ctx, patchHelper, dockerCluster); err != nil {
+		return errors.Wrap(err, "failed to patch DockerCluster")
+	}
+
+	// Delete the docker container hosting the load balancer
+	if err := externalLoadBalancer.Delete(ctx); err != nil {
+		return errors.Wrap(err, "failed to delete load balancer")
+	}
+
+	// Cluster is deleted so remove the finalizer.
+	controllerutil.RemoveFinalizer(dockerCluster, infrav1.ClusterFinalizer)
+
+	return nil
+}
+
+// SetupWithManager will add watches for this controller.
+func (r *DockerClusterReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
+	err := ctrl.NewControllerManagedBy(mgr).
+		For(&infrav1.DockerCluster{}).
+		WithOptions(options).
+		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(ctrl.LoggerFrom(ctx), r.WatchFilterValue)).
+		Watches(
+			&clusterv1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(util.ClusterToInfrastructureMapFunc(ctx, infrav1.GroupVersion.WithKind("DockerCluster"), mgr.GetClient(), &infrav1.DockerCluster{})),
+			builder.WithPredicates(
+				predicates.ClusterUnpaused(ctrl.LoggerFrom(ctx)),
+			),
+		).Complete(r)
+	if err != nil {
+		return errors.Wrap(err, "failed setting up with a controller manager")
+	}
+	return nil
+}
